@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -18,6 +18,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import numpy as np
 from PIL import Image, ImageFile, ImageOps
 
+from .budget import fit_to_budget
 from .metrics import compare
 from .options import Options
 
@@ -505,12 +506,85 @@ def compress_image(data: bytes, opts: Options) -> Encoded:
     )
 
 
+def budget_suffix(budget: int) -> str:
+    """A self-describing filename suffix, e.g. 51200 -> "_50kb"."""
+    if budget % 1024 == 0:
+        return f"_{budget // 1024}kb"
+    if budget % 1000 == 0:
+        return f"_{budget // 1000}kb"
+    return f"_{budget}b"
+
+
+def compress_to_budget(data: bytes, opts: Options, budget: int) -> Encoded:
+    """Best-looking version of the image that fits ``budget`` bytes.
+
+    The aspect ratio is preserved; resolution is the thing that gives, because
+    for any real photo a 50 KB ceiling is far below what full resolution can
+    reach at any quality.
+    """
+    src = _decode(data)
+    base = ImageOps.exif_transpose(src) or src
+
+    if opts.out_format in ("keep", "auto"):
+        # Both are worth trying and the score decides: JPEG wins on photos,
+        # but a screenshot forced to JPEG at the quality a small budget allows
+        # comes back with ringing all over the text, where a reduced palette
+        # stays crisp. Transparency rules JPEG out entirely.
+        formats = ["jpeg", "png"] if _is_opaque(base) else ["png"]
+    else:
+        formats = [opts.out_format]
+
+    best = None  # (score, fmt, data, label, w, h, mean, flat)
+    for fmt in formats:
+        ref = prepare(src, opts, for_jpeg=(fmt == "jpeg"))
+
+        # Metadata is dead weight against a hard ceiling; keep only the colour
+        # profile, and only when it is small enough to be worth the bytes.
+        extra: dict = {}
+        icc = src.info.get("icc_profile")
+        if opts.keep_icc and icc and len(icc) < budget // 20:
+            extra["icc_profile"] = icc
+
+        found = fit_to_budget(ref, opts, budget, fmt, extra)
+        if found is None:
+            continue
+        out, label, width, height, mean, flat, score = found
+        # Rank formats on the penalised score, not raw SSIM: a speckled JPEG
+        # can out-score a clean palette PNG on the mean alone.
+        if best is None or score > best[0]:
+            best = (score, fmt, out, label, width, height, mean, flat)
+
+    if best is None:
+        raise ValueError(
+            f"cannot fit {base.width}x{base.height} into {budget} bytes"
+        )
+
+    _, fmt, out, label, width, height, mean, flat = best
+    return Encoded(
+        data=out,
+        fmt=fmt,
+        label=label,
+        ssim=mean,
+        ssim_low=0.0,
+        flat_err=flat,
+        original_size=len(data),
+        width=width,
+        height=height,
+        met_target=True,
+        note="",
+    )
+
+
 @dataclass
 class FileResult:
     source: Path
     output: Optional[Path]
     encoded: Optional[Encoded]
     error: str = ""
+    #: The companion copy squeezed under a byte budget, when one was asked for.
+    budget_output: Optional[Path] = None
+    budget_encoded: Optional[Encoded] = None
+    budget_error: str = ""
 
     @property
     def ok(self) -> bool:
@@ -528,6 +602,22 @@ def output_path_for(src: Path, encoded_fmt: str, out_dir: Optional[Path], root: 
     return src.with_name(stem + ext)
 
 
+def budget_path_for(
+    src: Path, fmt: str, out_dir: Optional[Path], root: Optional[Path], suffix: str
+) -> Path:
+    """Path for the under-budget copy.
+
+    Unlike the main output this *always* carries the suffix - otherwise, when
+    writing into an output directory (where the main copy keeps the original
+    stem), the two copies would collide on the same path.
+    """
+    stem = src.stem + suffix
+    if out_dir:
+        rel = src.relative_to(root) if root else Path(src.name)
+        return out_dir / rel.parent / (stem + _EXT[fmt])
+    return src.with_name(stem + _EXT[fmt])
+
+
 def compress_file(
     src: Path,
     opts: Options,
@@ -537,6 +627,7 @@ def compress_file(
     in_place: bool = False,
     overwrite: bool = False,
     dry_run: bool = False,
+    budget: int = 0,
 ) -> FileResult:
     try:
         data = src.read_bytes()
@@ -544,22 +635,44 @@ def compress_file(
     except Exception as exc:  # noqa: BLE001 - report, never abort the batch
         return FileResult(src, None, None, f"{type(exc).__name__}: {exc}")
 
-    dest = output_path_for(src, encoded.fmt, out_dir, root, suffix, in_place)
+    res = FileResult(src, output_path_for(src, encoded.fmt, out_dir, root, suffix, in_place), encoded)
+
+    if budget:
+        try:
+            if encoded.size <= budget:
+                # The quality-targeted result already fits, and it is strictly
+                # better than anything a byte-first search would produce.
+                res.budget_encoded = replace(
+                    encoded, note="already under budget; same as the main copy"
+                )
+            else:
+                res.budget_encoded = compress_to_budget(data, opts, budget)
+            res.budget_output = budget_path_for(
+                src, res.budget_encoded.fmt, out_dir, root, budget_suffix(budget)
+            )
+        except Exception as exc:  # noqa: BLE001
+            res.budget_error = f"{type(exc).__name__}: {exc}"
+
     if dry_run:
-        return FileResult(src, dest, encoded)
+        return res
 
-    if dest != src and dest.exists() and not overwrite:
-        return FileResult(src, dest, encoded, f"refusing to overwrite {dest}")
+    writes = [(res.output, encoded)]
+    if res.budget_encoded is not None and res.budget_output is not None:
+        writes.append((res.budget_output, res.budget_encoded))
 
+    for dest, payload in writes:
+        if dest != src and dest.exists() and not overwrite:
+            res.error = f"refusing to overwrite {dest}"
+            return res
     try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_name(dest.name + ".tmp~")
-        tmp.write_bytes(encoded.data)
-        os.replace(tmp, dest)
-        # Keep the original's timestamps so sync tools stay sane.
         st = src.stat()
-        os.utime(dest, (st.st_atime, st.st_mtime))
+        for dest, payload in writes:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_name(dest.name + ".tmp~")
+            tmp.write_bytes(payload.data)
+            os.replace(tmp, dest)
+            # Keep the original's timestamps so sync tools stay sane.
+            os.utime(dest, (st.st_atime, st.st_mtime))
     except Exception as exc:  # noqa: BLE001
-        return FileResult(src, dest, encoded, f"{type(exc).__name__}: {exc}")
-
-    return FileResult(src, dest, encoded)
+        res.error = f"{type(exc).__name__}: {exc}"
+    return res

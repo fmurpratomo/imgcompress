@@ -14,6 +14,28 @@ from .core import INPUT_SUFFIXES, FileResult, compress_file
 from .options import DEFAULT_PRESET, LOW_SLACK, PRESETS, Options
 
 
+def parse_size(text: str) -> int:
+    """Parse a byte budget: "50kb", "50 KB", "500k", "1mb", "51200", or "off"."""
+    t = text.strip().lower().replace(" ", "")
+    if t in ("off", "no", "none", "0"):
+        return 0
+    mult = 1
+    for suffix, factor in (("kib", 1024), ("mib", 1024**2),
+                           ("kb", 1024), ("mb", 1024**2),
+                           ("k", 1024), ("m", 1024**2), ("b", 1)):
+        if t.endswith(suffix):
+            t, mult = t[: -len(suffix)], factor
+            break
+    try:
+        value = float(t)
+    except ValueError:
+        raise SystemExit(f"invalid size {text!r}; try 50kb, 500k or 51200")
+    n = int(value * mult)
+    if n < 1024:
+        raise SystemExit(f"size {text!r} is too small to hold an image")
+    return n
+
+
 def human(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if abs(n) < 1024 or unit == "GB":
@@ -84,6 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
                      choices=["keep", "auto", "jpeg", "png", "webp"],
                      help="output format; 'auto' picks whichever of PNG/JPEG is smaller "
                           "at the same measured quality (default: keep)")
+    out.add_argument("--also-under", default="50kb", metavar="SIZE",
+                     help="also write a second copy squeezed under SIZE, same aspect "
+                          "ratio (default: %(default)s; use 'off' to skip it)")
     out.add_argument("-n", "--dry-run", action="store_true", help="report savings without writing")
 
     qual = p.add_argument_group("quality")
@@ -163,10 +188,20 @@ def format_row(res: FileResult, width: int) -> str:
         detail += f", ssim {e.ssim:.4f}/{e.ssim_low:.3f}, band {e.flat_err:.2f}"
     if e.note:
         detail += f" [{e.note}]"
-    return (
+    row = (
         f"  {name:<{width}}  {bar} {human(e.original_size):>10} -> {human(e.size):>10}"
         f"  {e.saved_pct:5.1f}%   {detail}"
     )
+    if res.budget_error:
+        row += f"\n  {'':<{width}}  !  under-budget copy: {res.budget_error}"
+    elif res.budget_encoded is not None:
+        b = res.budget_encoded
+        row += (
+            f"\n  {'':<{width}}  + {'':>10}    {human(b.size):>10}"
+            f"  {b.saved_pct:5.1f}%   {b.fmt} {b.label}"
+        )
+        row += f" [{b.note}]" if b.note else f", ssim {b.ssim:.4f}"
+    return row
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -178,6 +213,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.in_place and not args.overwrite and not args.dry_run:
         raise SystemExit("--in-place rewrites your originals; pass --overwrite to confirm")
 
+    budget = parse_size(args.also_under)
     files, root = collect_inputs(args.inputs, args.recursive)
     if not files:
         print("no images found", file=sys.stderr)
@@ -185,6 +221,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     job = dict(
         opts=opts,
+        budget=budget,
         out_dir=args.out_dir,
         root=root,
         suffix=args.suffix,
@@ -198,7 +235,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         head = "DRY RUN - nothing will be written" if args.dry_run else f"Compressing {len(files)} image(s)"
         print(f"{head}\n  targets: mean ssim >= {opts.target_ssim:.3f}, "
               f"worst-1% >= {opts.effective_low():.3f}, "
-              f"banding <= {opts.effective_flat():.2f} levels\n")
+              f"banding <= {opts.effective_flat():.2f} levels")
+        if budget:
+            print(f"  plus a second copy of each, under {human(budget)}, "
+                  f"aspect ratio preserved")
+        print()
 
     workers = args.workers or min(8, len(files), os.cpu_count() or 1)
     results: List[FileResult] = []
@@ -242,6 +283,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "ssim_low": round(r.encoded.ssim_low, 5) if r.encoded else None,
                     "flat_err": round(r.encoded.flat_err, 3) if r.encoded else None,
                     "met_target": r.encoded.met_target if r.encoded else None,
+                    "budget_output": str(r.budget_output) if r.budget_output else None,
+                    "budget_bytes": r.budget_encoded.size if r.budget_encoded else None,
+                    "budget_dimensions": (
+                        [r.budget_encoded.width, r.budget_encoded.height]
+                        if r.budget_encoded else None
+                    ),
+                    "budget_setting": r.budget_encoded.label if r.budget_encoded else None,
+                    "budget_ssim": round(r.budget_encoded.ssim, 5) if r.budget_encoded else None,
+                    "budget_error": r.budget_error or None,
                 }
                 for r in results
             ],
@@ -254,6 +304,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     pct = 100.0 * (total_in - total_out) / total_in if total_in else 0.0
     print(f"\n{len(ok)} image(s): {human(total_in)} -> {human(total_out)}   saved {human(total_in - total_out)} ({pct:.1f}%)")
+    made = [r for r in ok if r.budget_encoded is not None]
+    if budget and made:
+        biggest = max(r.budget_encoded.size for r in made)
+        print(f"{len(made)} under-budget copy(ies): largest is {human(biggest)} "
+              f"(ceiling {human(budget)})")
+    short = [r for r in ok if r.budget_error]
+    for r in short:
+        print(f"no under-budget copy for {r.source.name}: {r.budget_error}", file=sys.stderr)
     if missed:
         print(f"{len(missed)} image(s) could not reach the target even at max quality; "
               f"the best available encode was kept.")
