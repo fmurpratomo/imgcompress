@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "imgcompress"
+version = "1.0.0"
+description = "Compress PNG/JPEG to the smallest file that still meets a measured quality target"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = ["Pillow>=9.1", "numpy>=1.20"]
+
+[project.scripts]
+imgcompress = "imgcompress.cli:main"
+
+[tool.setuptools]
+packages = ["imgcompress"]
