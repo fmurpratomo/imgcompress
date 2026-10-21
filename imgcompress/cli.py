@@ -81,13 +81,17 @@ def build_parser() -> argparse.ArgumentParser:
         prog="imgcompress",
         description=(
             "Compress PNG and JPEG images to the smallest size that still meets a "
-            "measured quality target (SSIM), rather than a guessed quality number."
+            "measured quality target (SSIM), rather than a guessed quality number. "
+            "Every output also stays under a byte ceiling (50 KB by default), "
+            "downscaling when the quality target alone cannot get there."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
-            "  imgcompress photo.jpg                     # writes photo_compressed.jpg\n"
-            "  imgcompress ./pics -r -o ./small          # whole tree into ./small\n"
+            "  imgcompress photo.jpg                     # writes photo_compressed.jpg, <= 50 KB\n"
+            "  imgcompress ./pics -r -o ./small          # whole tree into ./small, all <= 50 KB\n"
+            "  imgcompress ./pics -r --max-bytes 200kb   # a roomier ceiling\n"
+            "  imgcompress ./pics -r --max-bytes off     # quality target only, no ceiling\n"
             "  imgcompress *.png -p small                # lean harder on size\n"
             "  imgcompress shot.png --in-place --overwrite\n"
             "  imgcompress photo.jpg --max-side 1920 -p balanced\n"
@@ -106,9 +110,10 @@ def build_parser() -> argparse.ArgumentParser:
                      choices=["keep", "auto", "jpeg", "png", "webp"],
                      help="output format; 'auto' picks whichever of PNG/JPEG is smaller "
                           "at the same measured quality (default: keep)")
-    out.add_argument("--also-under", default="50kb", metavar="SIZE",
-                     help="also write a second copy squeezed under SIZE, same aspect "
-                          "ratio (default: %(default)s; use 'off' to skip it)")
+    out.add_argument("--max-bytes", default="50kb", metavar="SIZE",
+                     help="hard ceiling on every output file; resolution is reduced, "
+                          "aspect ratio intact, when the quality target alone cannot "
+                          "reach it (default: %(default)s; 'off' for no ceiling)")
     out.add_argument("-n", "--dry-run", action="store_true", help="report savings without writing")
 
     qual = p.add_argument_group("quality")
@@ -184,24 +189,18 @@ def format_row(res: FileResult, width: int) -> str:
     assert e is not None
     bar = "✓" if e.met_target else "!"
     detail = f"{e.fmt} {e.label}"
-    if e.label != "original kept":
+    if e.capped:
+        # The quality target was given up to meet the ceiling, so the two
+        # guards that go with it (worst-1%, banding) are not what decided this.
+        detail += f", ssim {e.ssim:.4f}, size-limited"
+    elif e.label != "original kept":
         detail += f", ssim {e.ssim:.4f}/{e.ssim_low:.3f}, band {e.flat_err:.2f}"
     if e.note:
         detail += f" [{e.note}]"
-    row = (
+    return (
         f"  {name:<{width}}  {bar} {human(e.original_size):>10} -> {human(e.size):>10}"
         f"  {e.saved_pct:5.1f}%   {detail}"
     )
-    if res.budget_error:
-        row += f"\n  {'':<{width}}  !  under-budget copy: {res.budget_error}"
-    elif res.budget_encoded is not None:
-        b = res.budget_encoded
-        row += (
-            f"\n  {'':<{width}}  + {'':>10}    {human(b.size):>10}"
-            f"  {b.saved_pct:5.1f}%   {b.fmt} {b.label}"
-        )
-        row += f" [{b.note}]" if b.note else f", ssim {b.ssim:.4f}"
-    return row
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -213,7 +212,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.in_place and not args.overwrite and not args.dry_run:
         raise SystemExit("--in-place rewrites your originals; pass --overwrite to confirm")
 
-    budget = parse_size(args.also_under)
+    max_bytes = parse_size(args.max_bytes)
     files, root = collect_inputs(args.inputs, args.recursive)
     if not files:
         print("no images found", file=sys.stderr)
@@ -221,7 +220,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     job = dict(
         opts=opts,
-        budget=budget,
+        max_bytes=max_bytes,
         out_dir=args.out_dir,
         root=root,
         suffix=args.suffix,
@@ -236,9 +235,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"{head}\n  targets: mean ssim >= {opts.target_ssim:.3f}, "
               f"worst-1% >= {opts.effective_low():.3f}, "
               f"banding <= {opts.effective_flat():.2f} levels")
-        if budget:
-            print(f"  plus a second copy of each, under {human(budget)}, "
-                  f"aspect ratio preserved")
+        if max_bytes:
+            print(f"  size limit: {human(max_bytes)} per file; anything that cannot "
+                  f"reach it at full resolution is downscaled")
         print()
 
     workers = args.workers or min(8, len(files), os.cpu_count() or 1)
@@ -283,15 +282,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "ssim_low": round(r.encoded.ssim_low, 5) if r.encoded else None,
                     "flat_err": round(r.encoded.flat_err, 3) if r.encoded else None,
                     "met_target": r.encoded.met_target if r.encoded else None,
-                    "budget_output": str(r.budget_output) if r.budget_output else None,
-                    "budget_bytes": r.budget_encoded.size if r.budget_encoded else None,
-                    "budget_dimensions": (
-                        [r.budget_encoded.width, r.budget_encoded.height]
-                        if r.budget_encoded else None
-                    ),
-                    "budget_setting": r.budget_encoded.label if r.budget_encoded else None,
-                    "budget_ssim": round(r.budget_encoded.ssim, 5) if r.budget_encoded else None,
-                    "budget_error": r.budget_error or None,
+                    "dimensions": [r.encoded.width, r.encoded.height] if r.encoded else None,
+                    "size_limited": r.encoded.capped if r.encoded else None,
                 }
                 for r in results
             ],
@@ -304,14 +296,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     pct = 100.0 * (total_in - total_out) / total_in if total_in else 0.0
     print(f"\n{len(ok)} image(s): {human(total_in)} -> {human(total_out)}   saved {human(total_in - total_out)} ({pct:.1f}%)")
-    made = [r for r in ok if r.budget_encoded is not None]
-    if budget and made:
-        biggest = max(r.budget_encoded.size for r in made)
-        print(f"{len(made)} under-budget copy(ies): largest is {human(biggest)} "
-              f"(ceiling {human(budget)})")
-    short = [r for r in ok if r.budget_error]
-    for r in short:
-        print(f"no under-budget copy for {r.source.name}: {r.budget_error}", file=sys.stderr)
+    if max_bytes and ok:
+        capped = [r for r in ok if r.encoded.capped]
+        biggest = max(r.encoded.size for r in ok)
+        print(f"largest output {human(biggest)}, ceiling {human(max_bytes)}; "
+              f"{len(capped)} of {len(ok)} downscaled to fit")
     if missed:
         print(f"{len(missed)} image(s) could not reach the target even at max quality; "
               f"the best available encode was kept.")

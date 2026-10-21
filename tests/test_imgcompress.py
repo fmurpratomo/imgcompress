@@ -14,7 +14,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from imgcompress import Options, compress_file, compress_image  # noqa: E402
-from imgcompress.cli import collect_inputs, main  # noqa: E402
+from imgcompress.cli import build_parser, collect_inputs, main, parse_size  # noqa: E402
 from imgcompress.core import (  # noqa: E402
     _exact_palette,
     _is_grayscale,
@@ -216,6 +216,17 @@ class TestOptions(unittest.TestCase):
 
 
 class TestHelpers(unittest.TestCase):
+    def test_parse_size(self):
+        self.assertEqual(parse_size("50kb"), 50 * 1024)
+        self.assertEqual(parse_size("50 KB"), 50 * 1024)
+        self.assertEqual(parse_size("500k"), 500 * 1024)
+        self.assertEqual(parse_size("1mb"), 1024 ** 2)
+        self.assertEqual(parse_size("51200"), 51200)
+        self.assertEqual(parse_size("off"), 0)
+        for bad in ("huge", "10"):  # unparseable, and too small to hold an image
+            with self.assertRaises(SystemExit):
+                parse_size(bad)
+
     def test_grayscale_detection(self):
         self.assertTrue(_is_grayscale(Image.new("RGB", (8, 8), (77, 77, 77))))
         self.assertFalse(_is_grayscale(Image.new("RGB", (8, 8), (77, 78, 77))))
@@ -447,6 +458,60 @@ class TestFiles(unittest.TestCase):
         res = compress_file(bad, Options())
         self.assertFalse(res.ok)
         self.assertIsNone(res.encoded)
+
+    def test_max_bytes_is_a_hard_ceiling(self):
+        src = self.write("big.jpg", photo_like(640, 480), quality=97)
+        res = compress_file(src, Options(), out_dir=self.dir / "out", root=self.dir,
+                            max_bytes=8 * 1024)
+        self.assertTrue(res.ok, res.error)
+        self.assertLessEqual(res.output.stat().st_size, 8 * 1024)
+        self.assertTrue(res.encoded.capped)
+        # Resolution is what gave; the aspect ratio survived it.
+        w, h = Image.open(res.output).size
+        self.assertLess(w, 640)
+        self.assertAlmostEqual(w / h, 640 / 480, places=2)
+
+    def test_only_one_file_is_written_per_image(self):
+        src = self.write("big.jpg", photo_like(640, 480), quality=97)
+        out = self.dir / "out"
+        res = compress_file(src, Options(), out_dir=out, root=self.dir, max_bytes=8 * 1024)
+        self.assertTrue(res.ok, res.error)
+        self.assertEqual([f.name for f in out.rglob("*") if f.is_file()], ["big.jpg"])
+
+    def test_no_ceiling_keeps_the_quality_targeted_encode(self):
+        src = self.write("big.jpg", photo_like(640, 480), quality=97)
+        capped = compress_file(src, Options(), out_dir=self.dir / "a", root=self.dir,
+                               max_bytes=8 * 1024)
+        free = compress_file(src, Options(), out_dir=self.dir / "b", root=self.dir)
+        self.assertTrue(free.ok, free.error)
+        self.assertFalse(free.encoded.capped)
+        self.assertGreater(free.encoded.size, capped.encoded.size)
+        self.assertEqual(Image.open(free.output).size, (640, 480))
+        self.assertGreaterEqual(free.encoded.ssim, Options().target_ssim)
+
+    def test_image_already_under_the_ceiling_is_untouched_by_it(self):
+        src = self.write("ui.png", flat_ui())
+        res = compress_file(src, Options(), out_dir=self.dir / "out", root=self.dir,
+                            max_bytes=50 * 1024)
+        self.assertTrue(res.ok, res.error)
+        self.assertFalse(res.encoded.capped)
+        self.assertEqual(Image.open(res.output).size, flat_ui().size)
+
+    def test_cli_default_ceiling_is_50kb(self):
+        self.assertEqual(parse_size(build_parser().parse_args(["x.png"]).max_bytes),
+                         50 * 1024)
+
+    def test_cli_caps_every_output_and_mirrors_the_tree(self):
+        self.write("a.png", flat_ui())
+        self.write("nested/b.jpg", photo_like(640, 480), quality=97)
+        out = self.dir / "out"
+        code = main([str(self.dir), "-r", "-o", str(out),
+                     "--max-bytes", "8kb", "-q", "-j", "1"])
+        self.assertEqual(code, 0)
+        written = sorted(f.relative_to(out).as_posix() for f in out.rglob("*") if f.is_file())
+        self.assertEqual(written, ["a.png", "nested/b.jpg"])
+        for f in written:
+            self.assertLessEqual((out / f).stat().st_size, 8 * 1024)
 
     def test_collect_inputs_recursion_and_filtering(self):
         self.write("a.png", flat_ui())

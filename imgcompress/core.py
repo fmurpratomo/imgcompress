@@ -8,9 +8,10 @@ nothing is ever written larger than the input.
 
 from __future__ import annotations
 
+import base64
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -26,6 +27,13 @@ from .options import Options
 INPUT_SUFFIXES = {".jpg", ".jpeg", ".jpe", ".png", ".webp"}
 
 _EXT = {"jpeg": ".jpg", "png": ".png", "webp": ".webp"}
+
+#: Media types for the base64 data URI written beside each output. JPEG is
+#: deliberately the informal "image/jpg" rather than the registered
+#: "image/jpeg" - it is what the consumers of these sidecars expect, and it
+#: works everywhere, because a data URI's payload is sniffed, not taken on
+#: trust from the label.
+_MIME = {"jpeg": "image/jpg", "png": "image/png", "webp": "image/webp"}
 
 #: Every suffix that already denotes a given format, so that rewriting
 #: "photo.jpeg" in place replaces it instead of dropping a "photo.jpg" beside it.
@@ -67,10 +75,23 @@ class Encoded:
     height: int
     met_target: bool
     note: str = ""
+    #: True when the size ceiling, not the quality target, decided the result.
+    capped: bool = False
 
     @property
     def size(self) -> int:
         return len(self.data)
+
+    @property
+    def media_type(self) -> str:
+        return _MIME[self.fmt]
+
+    @property
+    def data_uri(self) -> str:
+        """The encoded bytes as a ``data:`` URI, ready to paste into an
+        ``<img src>`` or a CSS ``url()``."""
+        b64 = base64.b64encode(self.data).decode("ascii")
+        return f"data:{self.media_type};base64,{b64}"
 
     @property
     def saved(self) -> int:
@@ -506,15 +527,6 @@ def compress_image(data: bytes, opts: Options) -> Encoded:
     )
 
 
-def budget_suffix(budget: int) -> str:
-    """A self-describing filename suffix, e.g. 51200 -> "_50kb"."""
-    if budget % 1024 == 0:
-        return f"_{budget // 1024}kb"
-    if budget % 1000 == 0:
-        return f"_{budget // 1000}kb"
-    return f"_{budget}b"
-
-
 def compress_to_budget(data: bytes, opts: Options, budget: int) -> Encoded:
     """Best-looking version of the image that fits ``budget`` bytes.
 
@@ -572,6 +584,7 @@ def compress_to_budget(data: bytes, opts: Options, budget: int) -> Encoded:
         height=height,
         met_target=True,
         note="",
+        capped=True,
     )
 
 
@@ -581,10 +594,8 @@ class FileResult:
     output: Optional[Path]
     encoded: Optional[Encoded]
     error: str = ""
-    #: The companion copy squeezed under a byte budget, when one was asked for.
-    budget_output: Optional[Path] = None
-    budget_encoded: Optional[Encoded] = None
-    budget_error: str = ""
+    #: The ".txt" sidecar holding the data URI, when one was asked for.
+    text_output: Optional[Path] = None
 
     @property
     def ok(self) -> bool:
@@ -602,22 +613,6 @@ def output_path_for(src: Path, encoded_fmt: str, out_dir: Optional[Path], root: 
     return src.with_name(stem + ext)
 
 
-def budget_path_for(
-    src: Path, fmt: str, out_dir: Optional[Path], root: Optional[Path], suffix: str
-) -> Path:
-    """Path for the under-budget copy.
-
-    Unlike the main output this *always* carries the suffix - otherwise, when
-    writing into an output directory (where the main copy keeps the original
-    stem), the two copies would collide on the same path.
-    """
-    stem = src.stem + suffix
-    if out_dir:
-        rel = src.relative_to(root) if root else Path(src.name)
-        return out_dir / rel.parent / (stem + _EXT[fmt])
-    return src.with_name(stem + _EXT[fmt])
-
-
 def compress_file(
     src: Path,
     opts: Options,
@@ -627,52 +622,52 @@ def compress_file(
     in_place: bool = False,
     overwrite: bool = False,
     dry_run: bool = False,
-    budget: int = 0,
+    max_bytes: int = 0,
+    base64_text: bool = False,
 ) -> FileResult:
+    """Compress ``src`` and write it out.
+
+    The image written is the smallest encode meeting the quality target -
+    unless it would exceed ``max_bytes``, in which case the ceiling wins and
+    the best-looking encode that fits is written instead.
+
+    With ``base64_text``, a ``<output name>.txt`` sidecar is written next to
+    it holding the same bytes as a ``data:`` URI. It carries the image's own
+    extension so that compressing both "a.png" and "a.jpg" into one directory
+    cannot make the two sidecars collide.
+    """
     try:
         data = src.read_bytes()
         encoded = compress_image(data, opts)
+        if max_bytes and encoded.size > max_bytes:
+            encoded = compress_to_budget(data, opts, max_bytes)
     except Exception as exc:  # noqa: BLE001 - report, never abort the batch
         return FileResult(src, None, None, f"{type(exc).__name__}: {exc}")
 
-    res = FileResult(src, output_path_for(src, encoded.fmt, out_dir, root, suffix, in_place), encoded)
+    dest = output_path_for(src, encoded.fmt, out_dir, root, suffix, in_place)
+    res = FileResult(src, dest, encoded)
 
-    if budget:
-        try:
-            if encoded.size <= budget:
-                # The quality-targeted result already fits, and it is strictly
-                # better than anything a byte-first search would produce.
-                res.budget_encoded = replace(
-                    encoded, note="already under budget; same as the main copy"
-                )
-            else:
-                res.budget_encoded = compress_to_budget(data, opts, budget)
-            res.budget_output = budget_path_for(
-                src, res.budget_encoded.fmt, out_dir, root, budget_suffix(budget)
-            )
-        except Exception as exc:  # noqa: BLE001
-            res.budget_error = f"{type(exc).__name__}: {exc}"
+    writes: List[Tuple[Path, bytes]] = [(dest, encoded.data)]
+    if base64_text:
+        res.text_output = dest.with_name(dest.name + ".txt")
+        writes.append((res.text_output, encoded.data_uri.encode("ascii")))
 
     if dry_run:
         return res
 
-    writes = [(res.output, encoded)]
-    if res.budget_encoded is not None and res.budget_output is not None:
-        writes.append((res.budget_output, res.budget_encoded))
-
-    for dest, payload in writes:
-        if dest != src and dest.exists() and not overwrite:
-            res.error = f"refusing to overwrite {dest}"
+    for target, _ in writes:
+        if target != src and target.exists() and not overwrite:
+            res.error = f"refusing to overwrite {target}"
             return res
     try:
         st = src.stat()
-        for dest, payload in writes:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            tmp = dest.with_name(dest.name + ".tmp~")
-            tmp.write_bytes(payload.data)
-            os.replace(tmp, dest)
+        for target, payload in writes:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(target.name + ".tmp~")
+            tmp.write_bytes(payload)
+            os.replace(tmp, target)
             # Keep the original's timestamps so sync tools stay sane.
-            os.utime(dest, (st.st_atime, st.st_mtime))
+            os.utime(target, (st.st_atime, st.st_mtime))
     except Exception as exc:  # noqa: BLE001
         res.error = f"{type(exc).__name__}: {exc}"
     return res

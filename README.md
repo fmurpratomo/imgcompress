@@ -13,6 +13,9 @@ using **SSIM**, then binary-searches the encoder settings for the smallest file
 that still clears the bar. Nothing that fails the bar is ever written, and the
 output is never larger than the input.
 
+On top of that, every output stays under a **byte ceiling** — 50 KB by default —
+so a folder of camera photos comes out web-ready. One file in, one file out.
+
 ## Install
 
 ```bash
@@ -28,13 +31,41 @@ pip install -e .
 ## Usage
 
 ```bash
-python3 -m imgcompress photo.jpg                  # writes photo_compressed.jpg
+python3 -m imgcompress photo.jpg                  # writes photo_compressed.jpg, <= 50 KB
 python3 -m imgcompress ./pics -r -o ./small       # a whole tree, in parallel
 python3 -m imgcompress ./pics -r -o ./small -f auto
+python3 -m imgcompress ./pics -r --max-bytes 200kb   # a roomier ceiling
+python3 -m imgcompress ./pics -r --max-bytes off     # quality target only
 python3 -m imgcompress shot.png --in-place --overwrite
 python3 -m imgcompress photo.jpg --max-side 1920 -p balanced
 python3 -m imgcompress ./pics -r --dry-run        # report savings, write nothing
 ```
+
+With the ceiling on, the whole tree lands under 50 KB a file:
+
+```
+$ python3 -m imgcompress ./pics -r -o ./small
+
+Compressing 5 image(s)
+  targets: mean ssim >= 0.990, worst-1% >= 0.950, banding <= 1.00 levels
+  size limit: 50.0 KB per file; anything that cannot reach it at full resolution is downscaled
+
+  screenshot.png  ✓     8.4 KB ->     1.7 KB   79.8%   png 4-colour palette, dithered, ssim 1.0000/1.000, band 0.01
+  logo.png        ✓    11.2 KB ->     2.9 KB   73.8%   png 4-colour palette, dithered, ssim 1.0000/1.000, band 0.01
+  portrait.jpg    ✓   479.3 KB ->    48.6 KB   89.9%   jpeg 506x899 q88 4:2:0, ssim 0.9478, size-limited
+  sunset.png      ✓     3.5 MB ->    49.2 KB   98.6%   jpeg 675x506 q93 4:2:0, ssim 0.9494, size-limited
+  beach.jpg       ✓     1.7 MB ->    50.0 KB   97.0%   jpeg 779x584 q90 4:2:0, ssim 0.9738, size-limited
+
+5 image(s): 5.6 MB -> 152.4 KB   saved 5.4 MB (97.3%)
+largest output 50.0 KB, ceiling 50.0 KB; 3 of 5 downscaled to fit
+```
+
+The two small images met the quality target well under the ceiling and were left
+at full resolution. The three photos could not, so they were downscaled — that
+is what `size-limited` means on a row.
+
+Turn the ceiling off with `--max-bytes off` and images are judged on quality
+alone — here on the five real images the preset table below uses:
 
 ```
 Compressing 5 image(s)
@@ -49,10 +80,37 @@ Compressing 5 image(s)
 5 image(s): 8.6 MB -> 2.8 MB   saved 5.7 MB (67.1%)
 ```
 
+## The size ceiling
+
+`--max-bytes` (default `50kb`) is a hard limit on each file written. The quality
+target still decides the result whenever it can: if the cheapest encode that
+clears the bar already fits, that is what ships, untouched.
+
+When it does not fit, the ceiling wins and **resolution is what gives**. A 12 MP
+photo cannot reach 50 KB at full resolution — even the lowest quality is an order
+of magnitude too big, and forcing it there just produces a blocky mess. So the
+tool tries a ladder of resolutions, finds the best quality that fits at each, and
+then *measures* which result actually looks best, comparing every candidate
+against the original at one common viewing size. The aspect ratio is preserved,
+and in `keep`/`auto` mode both JPEG and PNG are tried, because at a small budget
+a screenshot forced to JPEG comes back with ringing all over the text where a
+reduced palette stays crisp.
+
+Such a row is marked `size-limited` and prints its shipped dimensions and its
+measured SSIM — the quality target was deliberately abandoned to meet the
+ceiling, so the worst-1% and banding guards that accompany it are not reported.
+
+```bash
+python3 -m imgcompress ./pics -r -o ./small                   # <= 50 KB each
+python3 -m imgcompress ./pics -r -o ./small --max-bytes 1mb   # roomier
+python3 -m imgcompress ./pics -r -o ./small --max-bytes off   # quality only
+```
+
 ## Presets
 
-Pick with `-p`. Measured on the five real images above (photos, a UI screenshot,
-an icon with transparency), with `-f auto`:
+Pick with `-p`. Measured on five real images (photos, a UI screenshot, an icon
+with transparency), with `-f auto` and `--max-bytes off` — these are
+quality-target savings, with no ceiling involved:
 
 | preset | 5 MP photo | 12 MP photo | 12 MP graphic | screenshot | icon+alpha | **total** |
 |---|---|---|---|---|---|---|
@@ -157,6 +215,10 @@ formats alone.
 - If an image genuinely can't reach the target even at maximum quality (heavy
   grain, pure noise), it's marked `!` and the best available encode is kept.
   The tool says so rather than pretending it succeeded.
+- **One input, one output.** The ceiling is applied to the file that gets
+  written, not to a second copy beside it; `-o ./small` mirrors your tree with
+  the original filenames. An extension can still change (a photographic PNG
+  becomes a `.jpg`) when that is the only way to fit.
 - Forcing a format (`-f png` on a photo, say) can legitimately produce a
   *larger* file. That is allowed, because you asked for it, and the row is
   marked `larger than the input`. In `keep` and `auto` mode the original is
@@ -188,4 +250,4 @@ Path("photo.min.jpg").write_bytes(out.data)
 python3 -m unittest discover -s tests -v
 ```
 
-49 tests, no dependencies beyond Pillow and numpy.
+57 tests, no dependencies beyond Pillow and numpy.
