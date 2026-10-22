@@ -14,7 +14,9 @@ that still clears the bar. Nothing that fails the bar is ever written, and the
 output is never larger than the input.
 
 On top of that, every output stays under a **byte ceiling** — 50 KB by default —
-so a folder of camera photos comes out web-ready. One file in, one file out.
+so a folder of camera photos comes out web-ready, and each image is written
+alongside a **`.txt` holding it as a base64 data URI**, ready to paste straight
+into an `<img src>`.
 
 ## Install
 
@@ -36,6 +38,7 @@ python3 -m imgcompress ./pics -r -o ./small       # a whole tree, in parallel
 python3 -m imgcompress ./pics -r -o ./small -f auto
 python3 -m imgcompress ./pics -r --max-bytes 200kb   # a roomier ceiling
 python3 -m imgcompress ./pics -r --max-bytes off     # quality target only
+python3 -m imgcompress ./pics -r --no-base64         # images only, no .txt
 python3 -m imgcompress shot.png --in-place --overwrite
 python3 -m imgcompress photo.jpg --max-side 1920 -p balanced
 python3 -m imgcompress ./pics -r --dry-run        # report savings, write nothing
@@ -50,14 +53,22 @@ Compressing 5 image(s)
   targets: mean ssim >= 0.990, worst-1% >= 0.950, banding <= 1.00 levels
   size limit: 50.0 KB per file; anything that cannot reach it at full resolution is downscaled
 
+  plus a .txt beside each image, holding it as data:<type>;base64,...
+
   screenshot.png  ✓     8.4 KB ->     1.7 KB   79.8%   png 4-colour palette, dithered, ssim 1.0000/1.000, band 0.01
+                  +                   2.3 KB           screenshot.png.txt  image/png;base64
   logo.png        ✓    11.2 KB ->     2.9 KB   73.8%   png 4-colour palette, dithered, ssim 1.0000/1.000, band 0.01
+                  +                   3.9 KB           logo.png.txt  image/png;base64
   portrait.jpg    ✓   479.3 KB ->    48.6 KB   89.9%   jpeg 506x899 q88 4:2:0, ssim 0.9478, size-limited
+                  +                  64.8 KB           portrait.jpg.txt  image/jpg;base64
   sunset.png      ✓     3.5 MB ->    49.2 KB   98.6%   jpeg 675x506 q93 4:2:0, ssim 0.9494, size-limited
+                  +                  65.7 KB           sunset.jpg.txt  image/jpg;base64
   beach.jpg       ✓     1.7 MB ->    50.0 KB   97.0%   jpeg 779x584 q90 4:2:0, ssim 0.9738, size-limited
+                  +                  66.6 KB           beach.jpg.txt  image/jpg;base64
 
 5 image(s): 5.6 MB -> 152.4 KB   saved 5.4 MB (97.3%)
 largest output 50.0 KB, ceiling 50.0 KB; 3 of 5 downscaled to fit
+5 base64 .txt sidecar(s) written beside the images
 ```
 
 The two small images met the quality target well under the ceiling and were left
@@ -105,6 +116,36 @@ python3 -m imgcompress ./pics -r -o ./small                   # <= 50 KB each
 python3 -m imgcompress ./pics -r -o ./small --max-bytes 1mb   # roomier
 python3 -m imgcompress ./pics -r -o ./small --max-bytes off   # quality only
 ```
+
+## The base64 sidecars
+
+Every image written gets a `.txt` next to it containing exactly one line — the
+image as a data URI, nothing else:
+
+```
+./small/beach.jpg       51,168 bytes
+./small/beach.jpg.txt   data:image/jpg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBD…
+```
+
+```html
+<img src="data:image/jpg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBD…">
+```
+
+Details worth knowing:
+
+- **The name is the image's own name plus `.txt`** — `beach.jpg.txt`, not
+  `beach.txt`. Compressing both `a.png` and `a.jpg` into one directory would
+  otherwise give the two sidecars the same name.
+- **The media type matches the bytes**: `image/jpg` for JPEG, `image/png` for
+  PNG, `image/webp` for WebP. JPEG is deliberately spelled `image/jpg` rather
+  than the registered `image/jpeg`; browsers accept it, because a data URI's
+  payload is sniffed rather than taken on trust from the label.
+- **No trailing newline**, so the whole file *is* the URI — `open(f).read()`
+  needs no stripping.
+- Base64 costs about **4/3 of the image**, so a 50 KB JPEG lands around 67 KB of
+  text. Budget for that if the ceiling is what matters to you.
+- `--no-base64` turns them off. In the library the same string is on the result:
+  `compress_image(...).data_uri`.
 
 ## Presets
 
@@ -215,10 +256,11 @@ formats alone.
 - If an image genuinely can't reach the target even at maximum quality (heavy
   grain, pure noise), it's marked `!` and the best available encode is kept.
   The tool says so rather than pretending it succeeded.
-- **One input, one output.** The ceiling is applied to the file that gets
+- **One input, one image out.** The ceiling is applied to the file that gets
   written, not to a second copy beside it; `-o ./small` mirrors your tree with
   the original filenames. An extension can still change (a photographic PNG
-  becomes a `.jpg`) when that is the only way to fit.
+  becomes a `.jpg`) when that is the only way to fit — and the base64 sidecar
+  follows the name it actually ended up with.
 - Forcing a format (`-f png` on a photo, say) can legitimately produce a
   *larger* file. That is allowed, because you asked for it, and the row is
   marked `larger than the input`. In `keep` and `auto` mode the original is
@@ -240,6 +282,7 @@ out = compress_image(Path("photo.jpg").read_bytes(), Options(target_ssim=0.985))
 print(f"{out.saved_pct:.1f}% smaller, ssim {out.ssim:.4f} "
       f"(worst 1%: {out.ssim_low:.3f}, banding: {out.flat_err:.2f})")
 Path("photo.min.jpg").write_bytes(out.data)
+Path("photo.min.jpg.txt").write_text(out.data_uri)  # data:image/jpg;base64,…
 ```
 
 `--json` gives the same detail from the CLI for scripting.
@@ -250,4 +293,4 @@ Path("photo.min.jpg").write_bytes(out.data)
 python3 -m unittest discover -s tests -v
 ```
 
-57 tests, no dependencies beyond Pillow and numpy.
+63 tests, no dependencies beyond Pillow and numpy.

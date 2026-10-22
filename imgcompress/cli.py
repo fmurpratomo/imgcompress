@@ -83,7 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Compress PNG and JPEG images to the smallest size that still meets a "
             "measured quality target (SSIM), rather than a guessed quality number. "
             "Every output also stays under a byte ceiling (50 KB by default), "
-            "downscaling when the quality target alone cannot get there."
+            "downscaling when the quality target alone cannot get there, and "
+            "comes with a .txt sidecar holding the image as a base64 data URI."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -92,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  imgcompress ./pics -r -o ./small          # whole tree into ./small, all <= 50 KB\n"
             "  imgcompress ./pics -r --max-bytes 200kb   # a roomier ceiling\n"
             "  imgcompress ./pics -r --max-bytes off     # quality target only, no ceiling\n"
+            "  imgcompress ./pics -r --no-base64         # images only, no .txt sidecars\n"
             "  imgcompress *.png -p small                # lean harder on size\n"
             "  imgcompress shot.png --in-place --overwrite\n"
             "  imgcompress photo.jpg --max-side 1920 -p balanced\n"
@@ -114,6 +116,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="hard ceiling on every output file; resolution is reduced, "
                           "aspect ratio intact, when the quality target alone cannot "
                           "reach it (default: %(default)s; 'off' for no ceiling)")
+    out.add_argument("--no-base64", dest="base64", action="store_false",
+                     help="skip the .txt data URI written beside each image")
     out.add_argument("-n", "--dry-run", action="store_true", help="report savings without writing")
 
     qual = p.add_argument_group("quality")
@@ -197,10 +201,16 @@ def format_row(res: FileResult, width: int) -> str:
         detail += f", ssim {e.ssim:.4f}/{e.ssim_low:.3f}, band {e.flat_err:.2f}"
     if e.note:
         detail += f" [{e.note}]"
-    return (
+    row = (
         f"  {name:<{width}}  {bar} {human(e.original_size):>10} -> {human(e.size):>10}"
         f"  {e.saved_pct:5.1f}%   {detail}"
     )
+    if res.text_output is not None:
+        # The data URI is ~4/3 of the image, plus the prefix. Laid out to line
+        # up under the image's own size column.
+        row += (f"\n  {'':<{width}}  + {'':>10}    {human(len(e.data_uri)):>10}"
+                f"  {'':5}    {res.text_output.name}  {e.media_type};base64")
+    return row
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -221,6 +231,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     job = dict(
         opts=opts,
         max_bytes=max_bytes,
+        base64_text=args.base64,
         out_dir=args.out_dir,
         root=root,
         suffix=args.suffix,
@@ -238,6 +249,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         if max_bytes:
             print(f"  size limit: {human(max_bytes)} per file; anything that cannot "
                   f"reach it at full resolution is downscaled")
+        if args.base64:
+            print("  plus a .txt beside each image, holding it as "
+                  "data:<type>;base64,...")
         print()
 
     workers = args.workers or min(8, len(files), os.cpu_count() or 1)
@@ -284,6 +298,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "met_target": r.encoded.met_target if r.encoded else None,
                     "dimensions": [r.encoded.width, r.encoded.height] if r.encoded else None,
                     "size_limited": r.encoded.capped if r.encoded else None,
+                    "text_output": str(r.text_output) if r.text_output else None,
+                    "media_type": r.encoded.media_type if r.encoded else None,
                 }
                 for r in results
             ],
@@ -301,6 +317,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         biggest = max(r.encoded.size for r in ok)
         print(f"largest output {human(biggest)}, ceiling {human(max_bytes)}; "
               f"{len(capped)} of {len(ok)} downscaled to fit")
+    sidecars = [r for r in ok if r.text_output is not None]
+    if sidecars:
+        print(f"{len(sidecars)} base64 .txt sidecar(s) written beside the images")
     if missed:
         print(f"{len(missed)} image(s) could not reach the target even at max quality; "
               f"the best available encode was kept.")

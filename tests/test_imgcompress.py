@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import sys
 import tempfile
@@ -471,12 +472,13 @@ class TestFiles(unittest.TestCase):
         self.assertLess(w, 640)
         self.assertAlmostEqual(w / h, 640 / 480, places=2)
 
-    def test_only_one_file_is_written_per_image(self):
+    def test_only_one_image_is_written_per_image(self):
         src = self.write("big.jpg", photo_like(640, 480), quality=97)
         out = self.dir / "out"
         res = compress_file(src, Options(), out_dir=out, root=self.dir, max_bytes=8 * 1024)
         self.assertTrue(res.ok, res.error)
         self.assertEqual([f.name for f in out.rglob("*") if f.is_file()], ["big.jpg"])
+        self.assertIsNone(res.text_output)
 
     def test_no_ceiling_keeps_the_quality_targeted_encode(self):
         src = self.write("big.jpg", photo_like(640, 480), quality=97)
@@ -505,13 +507,78 @@ class TestFiles(unittest.TestCase):
         self.write("a.png", flat_ui())
         self.write("nested/b.jpg", photo_like(640, 480), quality=97)
         out = self.dir / "out"
-        code = main([str(self.dir), "-r", "-o", str(out),
+        code = main([str(self.dir), "-r", "-o", str(out), "--no-base64",
                      "--max-bytes", "8kb", "-q", "-j", "1"])
         self.assertEqual(code, 0)
         written = sorted(f.relative_to(out).as_posix() for f in out.rglob("*") if f.is_file())
         self.assertEqual(written, ["a.png", "nested/b.jpg"])
         for f in written:
             self.assertLessEqual((out / f).stat().st_size, 8 * 1024)
+
+    def test_base64_sidecar_holds_a_decodable_data_uri(self):
+        src = self.write("p.jpg", photo_like(320, 240), quality=95)
+        out = self.dir / "out"
+        res = compress_file(src, Options(), out_dir=out, root=self.dir, base64_text=True)
+        self.assertTrue(res.ok, res.error)
+        self.assertEqual(res.text_output, out / "p.jpg.txt")
+
+        text = res.text_output.read_text()
+        self.assertTrue(text.startswith("data:image/jpg;base64,"), text[:40])
+        self.assertEqual(text, text.strip())  # nothing but the URI itself
+        raw = base64.b64decode(text.split(",", 1)[1], validate=True)
+        self.assertEqual(raw, res.output.read_bytes())
+        Image.open(io.BytesIO(raw)).load()  # a real image came back out
+
+    def test_sidecar_media_type_follows_the_written_format(self):
+        png = compress_file(self.write("a.png", flat_ui()), Options(),
+                            out_dir=self.dir / "o1", root=self.dir, base64_text=True)
+        jpg = compress_file(self.write("b.jpg", photo_like(320, 240), quality=95),
+                            Options(), out_dir=self.dir / "o2", root=self.dir,
+                            base64_text=True)
+        self.assertEqual(png.encoded.media_type, "image/png")
+        self.assertEqual(jpg.encoded.media_type, "image/jpg")
+        self.assertTrue(png.text_output.read_text().startswith("data:image/png;base64,"))
+        self.assertTrue(jpg.text_output.read_text().startswith("data:image/jpg;base64,"))
+
+    def test_sidecar_is_named_after_the_image_it_holds(self):
+        """Both stems land on "a" in the output dir; the sidecars must not collide."""
+        self.write("a.png", flat_ui())
+        self.write("a.jpg", photo_like(320, 240), quality=95)
+        out = self.dir / "out"
+        self.assertEqual(main([str(self.dir), "-o", str(out), "-q", "-j", "1"]), 0)
+        self.assertEqual(
+            sorted(f.name for f in out.rglob("*") if f.is_file()),
+            ["a.jpg", "a.jpg.txt", "a.png", "a.png.txt"],
+        )
+
+    def test_dry_run_writes_no_sidecar(self):
+        src = self.write("p.png", flat_ui())
+        res = compress_file(src, Options(), out_dir=self.dir / "out",
+                            base64_text=True, dry_run=True)
+        self.assertTrue(res.ok)
+        self.assertIsNotNone(res.text_output)
+        self.assertFalse(res.text_output.exists())
+
+    def test_refuses_to_clobber_an_existing_sidecar(self):
+        src = self.write("p.png", flat_ui())
+        out = self.dir / "out"
+        out.mkdir()
+        (out / "p.png.txt").write_bytes(b"keep me")
+        res = compress_file(src, Options(), out_dir=out, root=self.dir, base64_text=True)
+        self.assertFalse(res.ok)
+        self.assertIn("refusing to overwrite", res.error)
+        self.assertEqual((out / "p.png.txt").read_bytes(), b"keep me")
+        self.assertFalse((out / "p.png").exists())  # nothing written at all
+
+    def test_cli_writes_sidecars_by_default(self):
+        self.write("a.png", flat_ui())
+        out = self.dir / "out"
+        self.assertEqual(main([str(self.dir), "-o", str(out), "-q", "-j", "1"]), 0)
+        self.assertTrue((out / "a.png.txt").read_text().startswith("data:image/png;base64,"))
+        self.assertEqual(main([str(self.dir), "-o", str(self.dir / "off"),
+                               "--no-base64", "-q", "-j", "1"]), 0)
+        self.assertEqual([f.name for f in (self.dir / "off").rglob("*") if f.is_file()],
+                         ["a.png"])
 
     def test_collect_inputs_recursion_and_filtering(self):
         self.write("a.png", flat_ui())
